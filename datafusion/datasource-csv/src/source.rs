@@ -22,7 +22,7 @@ use arrow::csv;
 use datafusion_common::config::CsvOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Result, exec_datafusion_err};
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::TaskSet;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
@@ -514,7 +514,7 @@ pub async fn plan_to_csv(
         .options()
         .execution
         .objectstore_writer_buffer_size;
-    let mut join_set = JoinSet::new();
+    let mut join_set = TaskSet::new(task_ctx.task_executor().clone());
     for i in 0..plan.output_partitioning().partition_count() {
         let storeref = Arc::clone(&store);
         let plan: Arc<dyn ExecutionPlan> = Arc::clone(&plan);
@@ -550,7 +550,7 @@ pub async fn plan_to_csv(
                 if e.is_panic() {
                     std::panic::resume_unwind(e.into_panic());
                 } else {
-                    unreachable!();
+                    return Err(e.into());
                 }
             }
         }

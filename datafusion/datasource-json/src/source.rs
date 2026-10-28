@@ -15,7 +15,7 @@ use crate::utils::{ChannelReader, JsonArrayToNdjsonReader};
 use datafusion_common::error::{DataFusionError, Result};
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::{SpawnedTask, TaskExecutor, TaskSet};
 use datafusion_datasource::boundary_stream::AlignedBoundaryStream;
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
@@ -59,10 +59,10 @@ struct JsonArrayStream {
     inner: ReceiverStream<std::result::Result<RecordBatch, arrow::error::ArrowError>>,
     /// Task that reads from object store and sends bytes to channel.
     /// Kept alive until stream is consumed or dropped.
-    _read_task: SpawnedTask<()>,
+    read_task: Option<SpawnedTask<()>>,
     /// Task that parses JSON and sends RecordBatches.
     /// Kept alive until stream is consumed or dropped.
-    _parse_task: SpawnedTask<()>,
+    parse_task: Option<SpawnedTask<()>>,
 }
 
 impl Stream for JsonArrayStream {
@@ -72,11 +72,27 @@ impl Stream for JsonArrayStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let this = self.as_mut().get_mut();
+        for task in [&mut this.read_task, &mut this.parse_task] {
+            if let Some(handle) = task.as_mut()
+                && let Poll::Ready(result) = Pin::new(handle).poll(cx)
+            {
+                task.take();
+                if let Err(error) = result {
+                    return Poll::Ready(Some(Err(
+                        arrow::error::ArrowError::ExternalError(Box::new(error)),
+                    )));
+                }
+            }
+        }
+        Pin::new(&mut this.inner).poll_next(cx)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let (lower, upper) = self.inner.size_hint();
+        let pending = usize::from(self.read_task.is_some())
+            + usize::from(self.parse_task.is_some());
+        (lower, upper.and_then(|upper| upper.checked_add(pending)))
     }
 }
 // ============================================================================
@@ -85,6 +101,7 @@ impl Stream for JsonArrayStream {
 
 /// A [`FileOpener`] that opens a JSON file and yields a [`FileOpenFuture`]
 pub struct JsonOpener {
+    task_executor: TaskExecutor,
     batch_size: usize,
     projected_schema: SchemaRef,
     file_compression_type: FileCompressionType,
@@ -104,6 +121,7 @@ impl JsonOpener {
         newline_delimited: bool,
     ) -> Self {
         Self {
+            task_executor: TaskExecutor::default(),
             batch_size,
             projected_schema,
             file_compression_type,
@@ -116,6 +134,7 @@ impl JsonOpener {
 /// JsonSource holds the extra configuration that is necessary for [`JsonOpener`]
 #[derive(Clone)]
 pub struct JsonSource {
+    task_executor: TaskExecutor,
     table_schema: datafusion_datasource::TableSchema,
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
@@ -130,6 +149,7 @@ impl JsonSource {
     pub fn new(table_schema: impl Into<datafusion_datasource::TableSchema>) -> Self {
         let table_schema = table_schema.into();
         Self {
+            task_executor: TaskExecutor::default(),
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
             batch_size: None,
@@ -160,6 +180,18 @@ impl From<JsonSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for JsonSource {
+    fn create_morselizer_with_context(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+        context: &TaskContext,
+    ) -> Result<Box<dyn datafusion_datasource::morsel::Morselizer>> {
+        let mut source = self.clone();
+        source.task_executor = context.task_executor().clone();
+        source.create_morselizer(object_store, base_config, partition)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -172,6 +204,7 @@ impl FileSource for JsonSource {
             Arc::new(file_schema.project(&self.projection.file_indices)?);
 
         let mut opener = Arc::new(JsonOpener {
+            task_executor: self.task_executor.clone(),
             batch_size: self
                 .batch_size
                 .expect("Batch size must set before creating opener"),
@@ -248,6 +281,8 @@ impl FileSource for JsonSource {
         // deciding how it is serialized is a compile error, not a silent
         // round-trip gap.
         let Self {
+            // Supplied by the execution context, not serialized with the plan.
+            task_executor: _,
             // Serialized in `base` and used to rebuild the source on decode.
             table_schema: _,
             // Set from `FileScanConfig` when the scan is opened.
@@ -331,6 +366,7 @@ impl FileOpener for JsonOpener {
     ///
     /// Note: JSON array format does not support range-based scanning.
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
+        let executor = self.task_executor.clone();
         let store = Arc::clone(&self.object_store);
         let schema = Arc::clone(&self.projected_schema);
         let batch_size = self.batch_size;
@@ -468,7 +504,7 @@ impl FileOpener for JsonOpener {
 
                         // Async task: read from object store stream and send bytes to channel
                         // Store the SpawnedTask to keep it alive until stream is dropped
-                        let read_task = SpawnedTask::spawn(async move {
+                        let read_task = executor.spawn(async move {
                             tokio::pin!(decompressed_stream);
                             while let Some(chunk) = decompressed_stream.next().await {
                                 match chunk {
@@ -494,7 +530,7 @@ impl FileOpener for JsonOpener {
 
                         // Blocking task: receive bytes from channel and parse JSON
                         // Store the SpawnedTask to keep it alive until stream is dropped
-                        let parse_task = SpawnedTask::spawn_blocking(move || {
+                        let parse_task = executor.spawn_blocking(move || {
                             let channel_reader = ChannelReader::new(byte_rx);
                             let mut ndjson_reader =
                                 JsonArrayToNdjsonReader::with_capacity(
@@ -531,8 +567,8 @@ impl FileOpener for JsonOpener {
                         // Wrap in JsonArrayStream to keep tasks alive until stream is consumed
                         let stream = JsonArrayStream {
                             inner: ReceiverStream::new(result_rx),
-                            _read_task: read_task,
-                            _parse_task: parse_task,
+                            read_task: Some(read_task),
+                            parse_task: Some(parse_task),
                         };
 
                         Ok(stream.map(|r| r.map_err(Into::into)).boxed())
@@ -557,7 +593,7 @@ pub async fn plan_to_json(
         .options()
         .execution
         .objectstore_writer_buffer_size;
-    let mut join_set = JoinSet::new();
+    let mut join_set = TaskSet::new(task_ctx.task_executor().clone());
     for i in 0..plan.output_partitioning().partition_count() {
         let storeref = Arc::clone(&store);
         let plan: Arc<dyn ExecutionPlan> = Arc::clone(&plan);
@@ -589,7 +625,7 @@ pub async fn plan_to_json(
                 if e.is_panic() {
                     std::panic::resume_unwind(e.into_panic());
                 } else {
-                    unreachable!();
+                    return Err(e.into());
                 }
             }
         }

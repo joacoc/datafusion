@@ -22,7 +22,7 @@ use datafusion_common::not_impl_err;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{DEFAULT_AVRO_EXTENSION, Diagnostic};
 use datafusion_common::{DataFusionError, Result, Statistics, internal_datafusion_err};
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::{SpawnedTask, TaskSet};
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
@@ -206,8 +206,8 @@ impl FileSink for AvroFileSink {
         mut file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
-        let mut file_write_tasks: JoinSet<Result<usize, DataFusionError>> =
-            JoinSet::new();
+        let mut file_write_tasks: TaskSet<Result<usize, DataFusionError>> =
+            TaskSet::new(context.task_executor().clone());
 
         let writer_schema = get_writer_schema(&self.config);
         while let Some((file_metadata, mut rx)) = file_stream_rx.recv().await {
@@ -279,7 +279,7 @@ impl FileSink for AvroFileSink {
                     if e.is_panic() {
                         std::panic::resume_unwind(e.into_panic());
                     } else {
-                        unreachable!();
+                        return Err(e.into());
                     }
                 }
             }
@@ -288,7 +288,7 @@ impl FileSink for AvroFileSink {
         demux_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            .map_err(DataFusionError::from)??;
         Ok(row_count as u64)
     }
 }

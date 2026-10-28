@@ -6,7 +6,7 @@
 
 use super::{SpillReaderStream, in_progress_spill_file::InProgressSpillFile};
 use crate::coop::cooperative;
-use crate::{common::spawn_buffered, metrics::SpillMetrics};
+use crate::{common::spawn_buffered_with_executor, metrics::SpillMetrics};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, config::SpillCompression};
@@ -192,7 +192,11 @@ impl SpillManager {
             max_record_batch_memory,
         )?));
 
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        Ok(spawn_buffered_with_executor(
+            stream,
+            self.batch_read_buffer_capacity,
+            self.env.task_executor.clone(),
+        ))
     }
 
     /// Same as `read_spill_as_stream`, but without buffering.

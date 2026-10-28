@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_with_executor;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
     replace_children_if_necessary,
@@ -697,7 +697,13 @@ impl ExternalSorter {
         let streams = self
             .sort_run_streams(runs)?
             .into_iter()
-            .map(|stream| spawn_buffered(stream, 1))
+            .map(|stream| {
+                spawn_buffered_with_executor(
+                    stream,
+                    1,
+                    self.runtime.task_executor.clone(),
+                )
+            })
             .collect();
 
         StreamingMergeBuilder::new()

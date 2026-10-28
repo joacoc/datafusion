@@ -604,21 +604,25 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
-            let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
-                stream,
-                txs,
-                partitioning.clone(),
-                range_router.clone(),
-                metrics,
-                // preserve_order depends on partition index to start from 0
-                if preserve_order { 0 } else { i },
-                num_input_partitions,
-            ));
+            let input_task =
+                context
+                    .task_executor()
+                    .spawn(RepartitionExec::pull_from_input(
+                        stream,
+                        txs,
+                        partitioning.clone(),
+                        range_router.clone(),
+                        metrics,
+                        // preserve_order depends on partition index to start from 0
+                        if preserve_order { 0 } else { i },
+                        num_input_partitions,
+                    ));
 
             // In a separate task, wait for each input to be done
             // (and pass along any errors, including panic!s)
-            let wait_for_task =
-                SpawnedTask::spawn(RepartitionExec::wait_for_task(input_task, senders));
+            let wait_for_task = context
+                .task_executor()
+                .spawn(RepartitionExec::wait_for_task(input_task, senders));
             spawned_tasks.push(wait_for_task);
         }
         *self = Self::ConsumingInputStreams(ConsumingInputStreamsState {
@@ -4036,7 +4040,7 @@ mod tests {
     #[tokio::test]
     async fn many_to_many_round_robin_within_tokio_task() -> Result<()> {
         let handle: SpawnedTask<Result<Vec<Vec<RecordBatch>>>> =
-            SpawnedTask::spawn(async move {
+            datafusion_common_runtime::TaskExecutor::default().spawn(async move {
                 // define input partitions
                 let schema = test_schema(false);
                 let partition = create_vec_batches(50);

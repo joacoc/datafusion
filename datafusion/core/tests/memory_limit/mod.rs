@@ -1014,6 +1014,7 @@ fn setup_context(
         .unwrap();
 
     let runtime = Arc::new(RuntimeEnv {
+        task_executor: runtime.task_executor.clone(),
         memory_pool: runtime.memory_pool.clone(),
         disk_manager: Arc::new(disk_manager),
         cache_manager: runtime.cache_manager.clone(),

@@ -24,7 +24,7 @@ use datafusion_common::{
     DEFAULT_ARROW_EXTENSION, DataFusionError, GetExt, Statistics,
     internal_datafusion_err, not_impl_err,
 };
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::{SpawnedTask, TaskSet};
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
@@ -298,8 +298,8 @@ impl FileSink for ArrowFileSink {
         mut file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
-        let mut file_write_tasks: JoinSet<std::result::Result<usize, DataFusionError>> =
-            JoinSet::new();
+        let mut file_write_tasks: TaskSet<std::result::Result<usize, DataFusionError>> =
+            TaskSet::new(context.task_executor().clone());
 
         let ipc_options = IpcWriteOptions::try_new(
             self.options.alignment,
@@ -361,7 +361,7 @@ impl FileSink for ArrowFileSink {
                     if e.is_panic() {
                         std::panic::resume_unwind(e.into_panic());
                     } else {
-                        unreachable!();
+                        return Err(e.into());
                     }
                 }
             }
@@ -370,7 +370,7 @@ impl FileSink for ArrowFileSink {
         demux_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            .map_err(DataFusionError::from)??;
         Ok(row_count as u64)
     }
 }

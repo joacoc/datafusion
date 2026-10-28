@@ -15,7 +15,7 @@ use datafusion_common::error::Result;
 use datafusion_common::{
     DataFusionError, exec_datafusion_err, internal_datafusion_err, internal_err,
 };
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::{SpawnedTask, TaskExecutor, TaskSet};
 use datafusion_execution::TaskContext;
 
 use arrow::array::RecordBatch;
@@ -72,16 +72,18 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
     mut data_rx: Receiver<RecordBatch>,
     serializer: Arc<dyn BatchSerializer>,
     mut writer: WriterType,
+    executor: TaskExecutor,
 ) -> SerializedRecordBatchResult {
     let (tx, mut rx) =
         mpsc::channel::<SpawnedTask<Result<(usize, Bytes), DataFusionError>>>(100);
-    let serialize_task = SpawnedTask::spawn(async move {
+    let child_executor = executor.clone();
+    let serialize_task = executor.spawn(async move {
         // Some serializers (like CSV) handle the first batch differently than
         // subsequent batches, so we track that here.
         let mut initial = true;
         while let Some(batch) = data_rx.recv().await {
             let serializer_clone = Arc::clone(&serializer);
-            let task = SpawnedTask::spawn(async move {
+            let task = child_executor.spawn(async move {
                 let num_rows = batch.num_rows();
                 let bytes = serializer_clone.serialize(batch, initial)?;
                 Ok((num_rows, bytes))
@@ -149,6 +151,7 @@ type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
 pub(crate) async fn stateless_serialize_and_write_files(
     mut rx: Receiver<FileWriteBundle>,
     tx: tokio::sync::oneshot::Sender<u64>,
+    executor: TaskExecutor,
 ) -> Result<()> {
     let mut row_count = 0;
     // tracks if any writers encountered an error triggering the need to abort
@@ -158,10 +161,12 @@ pub(crate) async fn stateless_serialize_and_write_files(
     // tracks if any errors were encountered in the process of aborting writers.
     // if true, we may not have a guarantee that all written data was cleaned up.
     let mut any_abort_errors = false;
-    let mut join_set = JoinSet::new();
+    let mut join_set = TaskSet::new(executor.clone());
     while let Some((data_rx, serializer, writer)) = rx.recv().await {
+        let executor = executor.clone();
         join_set.spawn(async move {
-            serialize_rb_stream_to_object_store(data_rx, serializer, writer).await
+            serialize_rb_stream_to_object_store(data_rx, serializer, writer, executor)
+                .await
         });
     }
     let mut finished_writers = Vec::with_capacity(join_set.len());
@@ -247,8 +252,9 @@ pub async fn spawn_writer_tasks_and_join(
 
     let (tx_file_bundle, rx_file_bundle) = mpsc::channel(rb_buffer_size.get() / 2);
     let (tx_row_cnt, rx_row_cnt) = tokio::sync::oneshot::channel();
-    let write_coordinator_task = SpawnedTask::spawn(async move {
-        stateless_serialize_and_write_files(rx_file_bundle, tx_row_cnt).await
+    let executor = context.task_executor().clone();
+    let write_coordinator_task = context.task_executor().spawn(async move {
+        stateless_serialize_and_write_files(rx_file_bundle, tx_row_cnt, executor).await
     });
     while let Some((file_metadata, rb_stream)) = file_stream_rx.recv().await {
         let writer = ObjectWriterBuilder::new(
@@ -285,8 +291,8 @@ pub async fn spawn_writer_tasks_and_join(
         write_coordinator_task.join_unwind(),
         demux_task.join_unwind()
     );
-    r1.map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
-    r2.map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+    r1.map_err(DataFusionError::from)??;
+    r2.map_err(DataFusionError::from)??;
 
     // Return total row count:
     rx_row_cnt.await.map_err(|_| {

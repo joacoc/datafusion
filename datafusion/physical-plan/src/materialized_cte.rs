@@ -41,7 +41,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, Statistics, internal_err};
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::TaskSet;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, SpillFile, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -333,7 +333,7 @@ async fn buffer_body(
     .with_compression_type(context.session_config().spill_compression());
     let buffered_rows = MetricBuilder::new(&metrics).global_counter("buffered_rows");
 
-    let mut join_set = JoinSet::new();
+    let mut join_set = TaskSet::new(context.task_executor().clone());
     for partition in 0..body.output_partitioning().partition_count() {
         let stream = body.execute(partition, Arc::clone(&context))?;
         let reservation =

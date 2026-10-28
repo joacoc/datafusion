@@ -23,7 +23,7 @@ use arrow::array::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, Statistics, internal_err};
-use datafusion_common_runtime::SpawnedTask;
+use datafusion_common_runtime::{SpawnedTask, TaskExecutor};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr_common::metrics::{
@@ -201,6 +201,7 @@ impl ExecutionPlan for BufferExec {
     ) -> Result<SendableRecordBatchStream> {
         let mem_reservation = MemoryConsumer::new(format!("BufferExec[{partition}]"))
             .register(context.memory_pool());
+        let executor = context.task_executor().clone();
         let in_stream = self.input.execute(partition, context)?;
 
         // Set up the metrics for the stream.
@@ -233,8 +234,12 @@ impl ExecutionPlan for BufferExec {
             }
         });
         // Buffer the input.
-        let out_stream =
-            MemoryBufferedStream::new(in_stream, self.capacity, mem_reservation);
+        let out_stream = MemoryBufferedStream::new_with_executor(
+            in_stream,
+            self.capacity,
+            mem_reservation,
+            &executor,
+        );
         // Update in the metrics that when an element gets out, some memory gets freed.
         let out_stream = out_stream.inspect_ok(move |v| {
             curr_mem_out.fetch_sub(v.get_array_memory_size(), Ordering::Relaxed);
@@ -389,7 +394,7 @@ pin_project! {
 /// Allows each message to have a different size, which is taken into account for determining if
 /// the queue is full or not.
 pub struct MemoryBufferedStream<T: SizedMessage> {
-    task: SpawnedTask<()>,
+    task: Option<SpawnedTask<()>>,
     batch_rx: UnboundedReceiver<Result<(T, OwnedSemaphorePermit)>>,
     memory_reservation: Arc<MemoryReservation>,
 }}
@@ -399,16 +404,31 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
     ///
     /// This immediately spawns a Tokio task that will start consumption of the input stream.
     pub fn new(
+        input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
+        capacity: usize,
+        memory_reservation: MemoryReservation,
+    ) -> Self {
+        Self::new_with_executor(
+            input,
+            capacity,
+            memory_reservation,
+            &TaskExecutor::default(),
+        )
+    }
+
+    /// Create a buffered stream using the supplied executor.
+    pub fn new_with_executor(
         mut input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
         capacity: usize,
         memory_reservation: MemoryReservation,
+        executor: &TaskExecutor,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(capacity));
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let memory_reservation = Arc::new(memory_reservation);
         let memory_reservation_clone = Arc::clone(&memory_reservation);
-        let task = SpawnedTask::spawn(async move {
+        let task = executor.spawn(async move {
             loop {
                 // Select on both the input stream and the channel being closed.
                 // By down this, we abort polling the input as soon as the consumer channel is
@@ -470,7 +490,7 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
         });
 
         Self {
-            task,
+            task: Some(task),
             batch_rx,
             memory_reservation: memory_reservation_clone,
         }
@@ -487,6 +507,14 @@ impl<T: SizedMessage> Stream for MemoryBufferedStream<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let self_project = self.project();
+        if let Some(task) = self_project.task.as_mut()
+            && let Poll::Ready(result) = Pin::new(task).poll(cx)
+        {
+            self_project.task.take();
+            if let Err(error) = result {
+                return Poll::Ready(Some(Err(error.into())));
+            }
+        }
         match self_project.batch_rx.poll_recv(cx) {
             Poll::Ready(Some(Ok((item, _semaphore_permit)))) => {
                 self_project.memory_reservation.shrink(item.size());
@@ -501,7 +529,7 @@ impl<T: SizedMessage> Stream for MemoryBufferedStream<T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         if self.batch_rx.is_closed() {
             let len = self.batch_rx.len();
-            (len, Some(len))
+            (len, len.checked_add(usize::from(self.task.is_some())))
         } else {
             (self.batch_rx.len(), None)
         }

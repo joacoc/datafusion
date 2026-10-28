@@ -276,7 +276,8 @@ impl ExecutionPlan for AnalyzeExec {
         // cancel outstanding futures on drop
         let num_input_partitions = self.input.output_partitioning().partition_count();
         let mut builder =
-            RecordBatchReceiverStream::builder(self.schema(), num_input_partitions);
+            RecordBatchReceiverStream::builder(self.schema(), num_input_partitions)
+                .with_task_executor(context.task_executor().clone());
 
         for input_partition in 0..num_input_partitions {
             builder.run_input(

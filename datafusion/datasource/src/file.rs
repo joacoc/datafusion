@@ -79,6 +79,20 @@ pub trait FileSource: Any + Send + Sync {
         Ok(Box::new(FileOpenerMorselizer::new(opener)))
     }
 
+    /// Create a morselizer with access to this query's execution context.
+    ///
+    /// Sources that submit tasks should use the context's task executor. The
+    /// default delegates to the existing context-independent implementation.
+    fn create_morselizer_with_context(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+        _context: &datafusion_execution::TaskContext,
+    ) -> Result<Box<dyn Morselizer>> {
+        self.create_morselizer(object_store, base_config, partition)
+    }
+
     /// Returns the table schema for the overall table (including partition columns, if any)
     ///
     /// This method returns the unprojected schema: the full schema of the data

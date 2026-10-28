@@ -98,11 +98,9 @@ where
     T: RecordBatchStream + Unpin,
 {
     inner: T,
-    #[cfg(datafusion_coop = "per_stream")]
     budget: u8,
 }
 
-#[cfg(datafusion_coop = "per_stream")]
 // Magic value that matches Tokio's task budget value
 const YIELD_FREQUENCY: u8 = 128;
 
@@ -116,7 +114,6 @@ where
     pub fn new(inner: T) -> Self {
         Self {
             inner,
-            #[cfg(datafusion_coop = "per_stream")]
             budget: YIELD_FREQUENCY,
         }
     }
@@ -132,6 +129,11 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        // Tokio's cooperative budget is unconstrained outside its executor.
+        // Preserve bounded progress for callers using another runtime.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return self.poll_next_per_stream(cx);
+        }
         #[cfg(any(
             datafusion_coop = "tokio",
             not(any(
@@ -173,21 +175,28 @@ where
 
         #[cfg(datafusion_coop = "per_stream")]
         {
-            if self.budget == 0 {
-                self.budget = YIELD_FREQUENCY;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-
-            let value = { self.inner.poll_next_unpin(cx) };
-
-            if value.is_ready() {
-                self.budget -= 1;
-            } else {
-                self.budget = YIELD_FREQUENCY;
-            }
-            value
+            self.poll_next_per_stream(cx)
         }
+    }
+}
+
+impl<T: RecordBatchStream + Unpin> CooperativeStream<T> {
+    fn poll_next_per_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        if self.budget == 0 {
+            self.budget = YIELD_FREQUENCY;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let value = self.inner.poll_next_unpin(cx);
+        if value.is_ready() {
+            self.budget -= 1;
+        } else {
+            self.budget = YIELD_FREQUENCY;
+        }
+        value
     }
 }
 

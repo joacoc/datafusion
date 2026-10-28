@@ -93,6 +93,7 @@ pub(crate) fn start_demuxer_task(
     context: &Arc<TaskContext>,
 ) -> (SpawnedTask<Result<()>>, DemuxedStreamReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let executor = context.task_executor().clone();
     let context = Arc::clone(context);
     let file_extension = config.file_extension.clone();
     let base_output_path = config.table_paths[0].clone();
@@ -100,7 +101,7 @@ pub(crate) fn start_demuxer_task(
         let single_file_output = config
             .file_output_mode
             .single_file_output(&base_output_path);
-        SpawnedTask::spawn(async move {
+        executor.spawn(async move {
             row_count_demuxer(
                 tx,
                 data,
@@ -116,7 +117,7 @@ pub(crate) fn start_demuxer_task(
         // bound this channel without risking a deadlock.
         let partition_by = config.table_partition_cols.clone();
         let keep_partition_by_columns = config.keep_partition_by_columns;
-        SpawnedTask::spawn(async move {
+        executor.spawn(async move {
             hive_style_partitions_demuxer(
                 tx,
                 data,

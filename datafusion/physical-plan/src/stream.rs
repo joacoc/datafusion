@@ -18,7 +18,7 @@ use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion_common::{Result, exec_err};
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::{TaskExecutor, TaskSet};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 
@@ -44,7 +44,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub(crate) struct ReceiverStreamBuilder<O> {
     tx: Sender<Result<O>>,
     rx: Receiver<Result<O>>,
-    join_set: JoinSet<Result<()>>,
+    join_set: TaskSet<Result<()>>,
 }
 
 impl<O: Send + 'static> ReceiverStreamBuilder<O> {
@@ -55,8 +55,18 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         Self {
             tx,
             rx,
-            join_set: JoinSet::new(),
+            join_set: TaskSet::default(),
         }
+    }
+
+    /// Select the executor before spawning any producer tasks.
+    fn with_task_executor(mut self, executor: TaskExecutor) -> Self {
+        assert!(
+            self.join_set.is_empty(),
+            "select an executor before spawning tasks"
+        );
+        self.join_set = TaskSet::new(executor);
+        self
     }
 
     /// Get a handle for sending data to the output
@@ -231,6 +241,15 @@ impl RecordBatchReceiverStreamBuilder {
             schema,
             inner: ReceiverStreamBuilder::new(capacity),
         }
+    }
+
+    /// Select the executor before spawning any producer tasks.
+    ///
+    /// # Panics
+    /// Panics if tasks have already been submitted to this builder.
+    pub fn with_task_executor(mut self, executor: TaskExecutor) -> Self {
+        self.inner = self.inner.with_task_executor(executor);
+        self
     }
 
     /// Get a handle for sending [`RecordBatch`] to the output

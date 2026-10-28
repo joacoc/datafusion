@@ -3,7 +3,7 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use datafusion_common::DataFusionError;
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::TaskSet;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -25,7 +25,7 @@ pub async fn plan_to_parquet(
     let parsed = ListingTableUrl::parse(path)?;
     let object_store_url = parsed.object_store();
     let store = task_ctx.runtime_env().object_store(&object_store_url)?;
-    let mut join_set = JoinSet::new();
+    let mut join_set = TaskSet::new(task_ctx.task_executor().clone());
     for i in 0..plan.output_partitioning().partition_count() {
         let plan: Arc<dyn ExecutionPlan> = Arc::clone(&plan);
         let filename = format!("{}/part-{i}.parquet", parsed.prefix());
@@ -65,7 +65,7 @@ pub async fn plan_to_parquet(
                 if e.is_panic() {
                     std::panic::resume_unwind(e.into_panic());
                 } else {
-                    unreachable!();
+                    return Err(e.into());
                 }
             }
         }

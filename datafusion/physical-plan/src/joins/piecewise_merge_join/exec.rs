@@ -10,10 +10,10 @@ use arrow::{
 use arrow_schema::{SchemaRef, SortOptions};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{JoinSide, Result, internal_datafusion_err, internal_err};
-use datafusion_common_runtime::SpawnedTask;
+
 use datafusion_execution::{
-    SendableRecordBatchStream,
-    memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    SendableRecordBatchStream, TaskContext,
+    memory_pool::{MemoryConsumer, MemoryReservation},
 };
 use datafusion_expr::{JoinType, Operator};
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
@@ -495,7 +495,7 @@ impl PiecewiseMergeJoinExec {
     /// partition themselves.
     fn buffered_side(
         &self,
-        context: &Arc<datafusion_execution::TaskContext>,
+        context: &Arc<TaskContext>,
         on_buffered: &PhysicalExprRef,
         metrics: &BuildProbeJoinMetrics,
         streamed_partitions: usize,
@@ -681,7 +681,7 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
     fn execute(
         &self,
         partition: usize,
-        context: Arc<datafusion_execution::TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let on_buffered = Arc::clone(&self.on.0);
         let on_streamed = Arc::clone(&self.on.1);
@@ -724,7 +724,7 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
                     Arc::clone(&on_buffered),
                     metrics.clone(),
                     reservation,
-                    Arc::clone(context.memory_pool()),
+                    Arc::clone(&context),
                     descending,
                 ))
             })?;
@@ -1149,7 +1149,7 @@ async fn build_buffered_extreme(
     on_buffered: PhysicalExprRef,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
-    memory_pool: Arc<dyn MemoryPool>,
+    context: Arc<TaskContext>,
     descending: bool,
 ) -> Result<BufferedExtreme> {
     let tasks: Vec<_> = buffered_streams
@@ -1163,8 +1163,8 @@ async fn build_buffered_extreme(
             let reservation = MemoryConsumer::new(format!(
                 "PiecewiseMergeJoinBufferedFold[{partition}]"
             ))
-            .register(&memory_pool);
-            SpawnedTask::spawn(partition_extreme(
+            .register(context.memory_pool());
+            context.task_executor().spawn(partition_extreme(
                 stream,
                 on_buffered,
                 metrics,

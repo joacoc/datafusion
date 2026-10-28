@@ -49,7 +49,7 @@ use datafusion_common::{
     Constraints, DataFusionError, Result, assert_eq_or_internal_err,
     assert_or_internal_err, exec_err,
 };
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::TaskSet;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr_common::sort_expr::{
@@ -1813,9 +1813,9 @@ pub async fn collect_partitioned(
         return Ok(vec![batches]);
     }
 
+    let mut join_set = TaskSet::new(context.task_executor().clone());
     let streams = execute_stream_partitioned(plan, context)?;
 
-    let mut join_set = JoinSet::new();
     // Execute the plan and collect the results into batches.
     streams.into_iter().enumerate().for_each(|(idx, stream)| {
         join_set.spawn(async move {
@@ -1836,7 +1836,7 @@ pub async fn collect_partitioned(
                 if e.is_panic() {
                     std::panic::resume_unwind(e.into_panic());
                 } else {
-                    unreachable!();
+                    return Err(e.into());
                 }
             }
         }

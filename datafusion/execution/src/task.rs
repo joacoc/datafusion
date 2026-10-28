@@ -122,6 +122,11 @@ impl TaskContext {
         &self.runtime.memory_pool
     }
 
+    /// Executor used by internal tasks belonging to this query.
+    pub fn task_executor(&self) -> &datafusion_common_runtime::TaskExecutor {
+        &self.runtime.task_executor
+    }
+
     /// Return the [RuntimeEnv] associated with this [TaskContext]
     pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
         Arc::clone(&self.runtime)

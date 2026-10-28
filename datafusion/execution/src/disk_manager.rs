@@ -8,6 +8,7 @@ use crate::spill_file::{SpillFile, SpillWriter, TempFileFactory};
 use bytes::Bytes;
 use datafusion_common::human_readable_size;
 use datafusion_common::{DataFusionError, Result, config_err, resources_datafusion_err};
+use datafusion_common_runtime::TaskExecutor;
 #[cfg(not(target_arch = "wasm32"))]
 use futures::StreamExt;
 use log::debug;
@@ -24,6 +25,7 @@ pub const DEFAULT_MAX_SPILL_MERGE_FAN_IN: usize = 0;
 /// Builder pattern for the [DiskManager] structure
 #[derive(Clone)]
 pub struct DiskManagerBuilder {
+    task_executor: TaskExecutor,
     /// The storage mode of the disk manager
     mode: DiskManagerMode,
     /// The maximum amount of data (in bytes) stored inside the temporary directories.
@@ -44,6 +46,7 @@ impl Debug for DiskManagerBuilder {
 impl Default for DiskManagerBuilder {
     fn default() -> Self {
         Self {
+            task_executor: TaskExecutor::default(),
             mode: DiskManagerMode::OsTmpDirectory,
             max_temp_directory_size: DEFAULT_MAX_TEMP_DIRECTORY_SIZE,
             max_spill_merge_fan_in: DEFAULT_MAX_SPILL_MERGE_FAN_IN,
@@ -52,6 +55,12 @@ impl Default for DiskManagerBuilder {
 }
 
 impl DiskManagerBuilder {
+    /// Set the executor used for local spill-file reads.
+    pub fn with_task_executor(mut self, executor: TaskExecutor) -> Self {
+        self.task_executor = executor;
+        self
+    }
+
     pub fn set_mode(&mut self, mode: DiskManagerMode) {
         self.mode = mode;
     }
@@ -103,6 +112,7 @@ impl DiskManagerBuilder {
     pub fn build(self) -> Result<DiskManager> {
         match self.mode {
             DiskManagerMode::OsTmpDirectory => Ok(DiskManager {
+                task_executor: self.task_executor,
                 local_dirs: Mutex::new(Some(vec![])),
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
@@ -112,6 +122,7 @@ impl DiskManagerBuilder {
                 factory: None,
             }),
             DiskManagerMode::Directories(conf_dirs) => Ok(DiskManager {
+                task_executor: self.task_executor,
                 // Created on the first `create_tmp_file`, as `OsTmpDirectory`
                 // already does, so building a `DiskManager` that never spills
                 // costs no directory syscalls.
@@ -124,6 +135,7 @@ impl DiskManagerBuilder {
                 factory: None,
             }),
             DiskManagerMode::Disabled => Ok(DiskManager {
+                task_executor: self.task_executor,
                 local_dirs: Mutex::new(None),
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
@@ -133,6 +145,7 @@ impl DiskManagerBuilder {
                 factory: None,
             }),
             DiskManagerMode::Custom(factory) => Ok(DiskManager {
+                task_executor: self.task_executor,
                 local_dirs: Mutex::new(None),
                 conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
@@ -178,6 +191,7 @@ impl Debug for DiskManagerMode {
 /// Manages files generated during query execution, e.g. spill files generated
 /// while processing dataset larger than available memory.
 pub struct DiskManager {
+    task_executor: TaskExecutor,
     /// TempDirs to put temporary files in.
     ///
     /// If `Some(vec![])` a new OS specified temporary directory will be created
@@ -375,8 +389,10 @@ impl DiskManager {
                     .tempfile_in(local_dirs[dir_index].as_ref())
                     .map_err(DataFusionError::IoError)?,
             ),
-            current_file_disk_usage: Arc::new(AtomicU64::new(0)),
-            disk_manager: Arc::clone(self),
+            accounting: Arc::new(SpillFileAccounting {
+                current_file_disk_usage: Arc::new(AtomicU64::new(0)),
+                disk_manager: Arc::clone(self),
+            }),
         }))
     }
 }
@@ -399,13 +415,8 @@ pub struct RefCountedTempFile {
     parent_temp_dir: Arc<TempDir>,
     /// The underlying temporary file, wrapped in Arc to allow cloning
     tempfile: Arc<NamedTempFile>,
-    /// Tracks the current disk usage of this temporary file.
-    ///
-    /// This is wrapped in `Arc<AtomicU64>` so that all clones share the same
-    /// disk usage tracking, preventing incorrect accounting when clones are dropped.
-    current_file_disk_usage: Arc<AtomicU64>,
-    /// The disk manager that created and manages this temporary file
-    disk_manager: Arc<DiskManager>,
+    /// Shared quota ownership, including outstanding blocking reads.
+    accounting: Arc<SpillFileAccounting>,
 }
 
 impl Clone for RefCountedTempFile {
@@ -413,8 +424,7 @@ impl Clone for RefCountedTempFile {
         Self {
             parent_temp_dir: Arc::clone(&self.parent_temp_dir),
             tempfile: Arc::clone(&self.tempfile),
-            current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
-            disk_manager: Arc::clone(&self.disk_manager),
+            accounting: Arc::clone(&self.accounting),
         }
     }
 }
@@ -429,25 +439,29 @@ impl RefCountedTempFile {
     }
 
     fn current_disk_usage(&self) -> u64 {
-        self.current_file_disk_usage.load(Ordering::Relaxed)
+        self.accounting
+            .current_file_disk_usage
+            .load(Ordering::Relaxed)
     }
 }
 
-/// When the temporary file is dropped, subtract its disk usage from the disk manager's total
-impl Drop for RefCountedTempFile {
+/// Release quota exactly once when the final spill-file owner is dropped.
+/// Using an Arc-owned guard avoids racing strong-count checks in concurrent drops.
+#[derive(Debug)]
+struct SpillFileAccounting {
+    current_file_disk_usage: Arc<AtomicU64>,
+    disk_manager: Arc<DiskManager>,
+}
+
+impl Drop for SpillFileAccounting {
     fn drop(&mut self) {
-        // Only subtract disk usage when this is the last reference to the file
-        // Check if we're the last one by seeing if there's only one strong reference
-        // left to the underlying tempfile (the one we're holding)
-        if Arc::strong_count(&self.tempfile) == 1 {
-            let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
-            self.disk_manager
-                .used_disk_space
-                .fetch_sub(current_usage, Ordering::Relaxed);
-            self.disk_manager
-                .active_files_count
-                .fetch_sub(1, Ordering::Relaxed);
-        }
+        let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
+        self.disk_manager
+            .used_disk_space
+            .fetch_sub(current_usage, Ordering::Relaxed);
+        self.disk_manager
+            .active_files_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -534,6 +548,36 @@ impl SpillFile for RefCountedTempFile {
         &self,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes>> + Send>>>
     {
+        if !self.accounting.disk_manager.task_executor.is_tokio() {
+            let executor = self.accounting.disk_manager.task_executor.clone();
+            // Keep the spill file and its quota accounting alive until the last
+            // read finishes, including when a running blocking read outlives cancellation.
+            let file = self.clone();
+            let stream = futures::stream::try_unfold(
+                (None, file, executor),
+                |(reader, file, executor)| async move {
+                    let (reader, file, bytes) = executor
+                        .spawn_blocking(move || -> std::io::Result<_> {
+                            use std::io::Read;
+                            let mut reader = match reader {
+                                Some(reader) => reader,
+                                None => file.inner().reopen()?,
+                            };
+                            let mut buffer = vec![0; 128 * 1024];
+                            let len = reader.read(&mut buffer)?;
+                            buffer.truncate(len);
+                            Ok((reader, file, Bytes::from(buffer)))
+                        })
+                        .join_unwind()
+                        .await??;
+                    Ok::<_, DataFusionError>(
+                        (!bytes.is_empty())
+                            .then_some((bytes, (Some(reader), file, executor))),
+                    )
+                },
+            );
+            return Ok(Box::pin(stream));
+        }
         let path = self.path().to_owned();
 
         let stream =
@@ -579,8 +623,8 @@ impl SpillFile for RefCountedTempFile {
             .map_err(DataFusionError::IoError)?;
         Ok(Box::new(FileSpillWriter {
             file,
-            disk_manager: Arc::clone(&self.disk_manager),
-            current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
+            disk_manager: Arc::clone(&self.accounting.disk_manager),
+            current_file_disk_usage: Arc::clone(&self.accounting.current_file_disk_usage),
         }))
     }
 }
@@ -1257,5 +1301,62 @@ mod tests {
             escape_for_temp_file_name_prefix(&"a".repeat(200)),
             format!(".tmp.{}.", "a".repeat(118))
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancelled_read_retains_quota_until_blocking_work_is_dropped() -> Result<()> {
+        use datafusion_common_runtime::TaskSpawner;
+        use futures::FutureExt;
+        use futures::future::BoxFuture;
+        use futures::task::SpawnError;
+        use std::io::Write;
+
+        #[derive(Default)]
+        struct QueuedRead {
+            jobs: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+        }
+        impl TaskSpawner for QueuedRead {
+            fn spawn(
+                &self,
+                _task: BoxFuture<'static, ()>,
+            ) -> std::result::Result<(), SpawnError> {
+                Err(SpawnError::shutdown())
+            }
+            fn spawn_blocking(
+                &self,
+                job: Box<dyn FnOnce() + Send>,
+            ) -> std::result::Result<(), SpawnError> {
+                self.jobs.lock().unwrap().push(job);
+                Ok(())
+            }
+        }
+
+        let spawner = Arc::new(QueuedRead::default());
+        let executor = TaskExecutor::new(Arc::clone(&spawner) as Arc<dyn TaskSpawner>);
+        let manager = Arc::new(
+            DiskManagerBuilder::default()
+                .with_task_executor(executor)
+                .build()?,
+        );
+        let file = manager.create_tmp_file("cancelled read")?;
+        let path = file.path().unwrap().to_path_buf();
+        {
+            let mut writer = file.open_writer()?;
+            writer.write_all(b"retained spill data")?;
+        }
+        let mut stream = file.read_stream()?;
+        assert!(stream.next().now_or_never().is_none());
+        drop(stream);
+        drop(file);
+        assert_eq!(manager.used_disk_space(), 19);
+        assert_eq!(manager.spilling_progress().active_files_count, 1);
+        assert!(path.exists());
+        let job = spawner.jobs.lock().unwrap().pop().unwrap();
+        job();
+        assert_eq!(manager.used_disk_space(), 0);
+        assert_eq!(manager.spilling_progress().active_files_count, 0);
+        assert!(!path.exists());
+        Ok(())
     }
 }

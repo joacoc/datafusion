@@ -16,7 +16,7 @@ use crate::{Session, TableProvider, TableProviderFactory};
 use arrow::array::{RecordBatch, RecordBatchReader, RecordBatchWriter};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{Constraints, DataFusionError, Result, config_err, plan_err};
-use datafusion_common_runtime::SpawnedTask;
+
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::dml::InsertOp;
@@ -449,10 +449,11 @@ impl PartitionStream for StreamRead {
         self.0.source.schema()
     }
 
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let config = Arc::clone(&self.0);
         let schema = Arc::clone(self.0.source.schema());
-        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 2);
+        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 2)
+            .with_task_executor(ctx.task_executor().clone());
         let tx = builder.tx();
         builder.spawn_blocking(move || {
             let reader = config.reader()?;
@@ -510,12 +511,12 @@ impl StreamWrite {
     async fn write_all_inner(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let config = Arc::clone(&self.0);
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<RecordBatch>(2);
         // Note: FIFO Files support poll so this could use AsyncFd
-        let write_task = SpawnedTask::spawn_blocking(move || {
+        let write_task = context.task_executor().spawn_blocking(move || {
             let mut count = 0_u64;
             let mut writer = config.writer()?;
             while let Some(batch) = receiver.blocking_recv() {
@@ -534,6 +535,6 @@ impl StreamWrite {
         write_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))?
+            .map_err(DataFusionError::from)?
     }
 }

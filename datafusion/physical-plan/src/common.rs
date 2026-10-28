@@ -171,15 +171,32 @@ pub fn project_plan_to_schema(
 /// allowing it to execute in parallel with an intermediate buffer of size `buffer`.
 /// At most `buffer` record batches will be produced ahead of the consumer.
 pub fn spawn_buffered(
-    mut input: SendableRecordBatchStream,
+    input: SendableRecordBatchStream,
     buffer: usize,
 ) -> SendableRecordBatchStream {
-    // Use tokio only if running from a multi-thread tokio context
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
-            let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer);
+    spawn_buffered_with_executor(
+        input,
+        buffer,
+        datafusion_common_runtime::TaskExecutor::default(),
+    )
+}
+
+/// Buffer a stream using the supplied executor. The default executor retains
+/// the existing optimization for multi-threaded Tokio runtimes.
+pub fn spawn_buffered_with_executor(
+    mut input: SendableRecordBatchStream,
+    buffer: usize,
+    executor: datafusion_common_runtime::TaskExecutor,
+) -> SendableRecordBatchStream {
+    // Preserve Tokio's buffering policy; custom executors control their own task placement.
+    let should_buffer = !executor.is_tokio()
+        || tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+    match should_buffer {
+        true => {
+            let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer)
+                .with_task_executor(executor);
 
             let sender = builder.tx();
 
@@ -208,7 +225,7 @@ pub fn spawn_buffered(
 
             builder.build()
         }
-        _ => input,
+        false => input,
     }
 }
 

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_with_executor;
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
@@ -360,7 +360,11 @@ impl ExecutionPlan for SortPreservingMergeExec {
                     .map(|partition| {
                         let stream =
                             self.input.execute(partition, Arc::clone(&context))?;
-                        Ok(spawn_buffered(stream, 1))
+                        Ok(spawn_buffered_with_executor(
+                            stream,
+                            1,
+                            context.task_executor().clone(),
+                        ))
                     })
                     .collect::<Result<_>>()?;
 

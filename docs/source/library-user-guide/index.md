@@ -41,6 +41,55 @@ DataFusion is designed to be extensible at all points, including
 - [x] User Defined `LogicalPlan` nodes
 - [x] User Defined `ExecutionPlan` nodes
 
+## Task execution
+
+DataFusion uses Tokio for internal query tasks by default. Applications can
+provide a `TaskSpawner` through `RuntimeEnvBuilder::with_task_spawner` to run
+these tasks on another executor. The choice belongs to the runtime environment;
+independent environments can use different executors in the same process.
+
+```rust
+use std::sync::Arc;
+
+use datafusion::common::runtime::TaskSpawner;
+use datafusion::error::Result;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+
+fn runtime(spawner: Arc<dyn TaskSpawner>) -> Result<Arc<RuntimeEnv>> {
+    RuntimeEnvBuilder::new()
+        .with_task_spawner(spawner)
+        .build_arc()
+}
+```
+
+A spawner submits asynchronous futures and blocking closures without waiting for
+them. Asynchronous tasks must make progress independently of the submitting task.
+Blocking jobs need a separate pool so they cannot block the asynchronous tasks
+that produce or consume their data. Accepted work must eventually run or be
+dropped when the executor shuts down; rejected submissions return `SpawnError`.
+DataFusion handles typed results, cancellation, and panic propagation.
+
+Dropping a query stream requests cancellation of its tasks. Asynchronous
+cancellation takes effect when the executor next polls the task. A blocking job
+that has already started runs to completion; cancellation can prevent a queued
+job from starting. Outside a Tokio runtime, cooperative streams use a local
+progress budget to yield periodically. All existing `Send` and `Sync` requirements
+remain in place.
+
+The default local spill-file implementation uses the configured executor for
+blocking reads when a custom spawner is supplied. An explicitly supplied
+`DiskManager` retains its own executor; configure it with
+`DiskManagerBuilder::with_task_executor` when necessary. Object stores, custom
+sources, custom spill backends, and the FFI interface can have separate runtime
+requirements. Supplying a spawner does not change those requirements or remove
+Tokio from the dependency tree.
+
+Custom operators should submit tasks through `TaskContext::task_executor` and
+create `TaskSet` collections with that executor. `SpawnedTask::spawn` and
+`JoinSet::new` remain conveniences for the current Tokio runtime. Task handles
+now return `TaskError`; `into_join_error` recovers a native Tokio error when the
+task used the default executor.
+
 [user guide]: ../user-guide/example-usage.md
 [contributor guide]: ../contributor-guide/index.md
 [docs]: https://docs.rs/datafusion/latest/datafusion/#architecture

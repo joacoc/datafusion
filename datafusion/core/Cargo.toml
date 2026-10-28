@@ -167,6 +167,7 @@ uuid = { workspace = true, features = ["v4", "js"] }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures = { workspace = true, features = ["thread-pool"] }
 async-trait = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio", "async_futures"] }
 ctor = { workspace = true }

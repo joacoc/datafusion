@@ -52,6 +52,7 @@ arrow_buffer_pool = [
 sql = []
 
 [dependencies]
+datafusion-common-runtime = { workspace = true }
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 async-trait = { workspace = true }

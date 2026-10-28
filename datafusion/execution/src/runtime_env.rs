@@ -18,6 +18,7 @@ use crate::cache::cache_manager::{CacheManager, CacheManagerConfig};
 #[cfg(feature = "parquet_encryption")]
 use crate::parquet_encryption::{EncryptionFactory, EncryptionFactoryRegistry};
 use datafusion_common::{Result, config::ConfigEntry};
+use datafusion_common_runtime::{TaskExecutor, TaskSpawner};
 use object_store::ObjectStore;
 use std::sync::Arc;
 use std::{
@@ -58,6 +59,8 @@ use url::Url;
 ///     .unwrap();
 /// ```
 pub struct RuntimeEnv {
+    /// Executor used for internal query tasks. Defaults to Tokio.
+    pub task_executor: TaskExecutor,
     /// Runtime memory management
     pub memory_pool: Arc<dyn MemoryPool>,
     /// Manage temporary files during query execution
@@ -343,6 +346,8 @@ impl Default for RuntimeEnv {
 /// See example on [`RuntimeEnv`]
 #[derive(Clone)]
 pub struct RuntimeEnvBuilder {
+    /// Executor used for internal query tasks. Defaults to Tokio.
+    pub task_executor: TaskExecutor,
     /// DiskManager to manage temporary disk file usage
     pub disk_manager: Option<Arc<DiskManager>>,
     /// DiskManager builder to manager temporary disk file usage
@@ -370,6 +375,7 @@ impl RuntimeEnvBuilder {
     /// New with default values
     pub fn new() -> Self {
         Self {
+            task_executor: TaskExecutor::default(),
             disk_manager: Default::default(),
             disk_manager_builder: Default::default(),
             memory_pool: Default::default(),
@@ -378,6 +384,16 @@ impl RuntimeEnvBuilder {
             #[cfg(feature = "parquet_encryption")]
             parquet_encryption_factory_registry: Default::default(),
         }
+    }
+
+    /// Supply an executor for internal query tasks.
+    ///
+    /// The spawner must independently drive submitted tasks and run blocking jobs
+    /// off its asynchronous execution threads. Custom I/O implementations may
+    /// impose their own runtime requirements.
+    pub fn with_task_spawner(mut self, spawner: Arc<dyn TaskSpawner>) -> Self {
+        self.task_executor = TaskExecutor::new(spawner);
+        self
     }
 
     /// Customize the disk manager builder
@@ -470,6 +486,7 @@ impl RuntimeEnvBuilder {
     /// Build a RuntimeEnv
     pub fn build(self) -> Result<RuntimeEnv> {
         let Self {
+            task_executor,
             disk_manager,
             disk_manager_builder,
             memory_pool,
@@ -482,12 +499,19 @@ impl RuntimeEnvBuilder {
             memory_pool.unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
 
         let disk_manager: Arc<DiskManager> = match (disk_manager, disk_manager_builder) {
-            (_, Some(builder)) => Arc::new(builder.build()?),
+            (_, Some(builder)) => {
+                Arc::new(builder.with_task_executor(task_executor.clone()).build()?)
+            }
             (Some(manager), None) => manager,
-            (None, None) => Arc::new(DiskManagerBuilder::default().build()?),
+            (None, None) => Arc::new(
+                DiskManagerBuilder::default()
+                    .with_task_executor(task_executor.clone())
+                    .build()?,
+            ),
         };
 
         Ok(RuntimeEnv {
+            task_executor,
             memory_pool,
             disk_manager,
             cache_manager: CacheManager::try_new(&cache_manager)?,
@@ -521,6 +545,7 @@ impl RuntimeEnvBuilder {
         };
 
         Self {
+            task_executor: runtime_env.task_executor.clone(),
             disk_manager: Some(Arc::clone(&runtime_env.disk_manager)),
             disk_manager_builder: None,
             memory_pool: Some(Arc::clone(&runtime_env.memory_pool)),

@@ -36,6 +36,7 @@ use crate::utils::datafusion_strsim::{levenshtein_with_buffer, normalized_levens
 use crate::utils::quote_identifier;
 use crate::{Column, DFSchema, Diagnostic, TableReference};
 use arrow::error::ArrowError;
+use datafusion_common_runtime::TaskError;
 #[cfg(feature = "parquet")]
 use parquet::errors::ParquetError;
 #[cfg(feature = "sql")]
@@ -349,6 +350,15 @@ impl Display for SchemaError {
 }
 
 impl Error for SchemaError {}
+
+impl From<TaskError> for DataFusionError {
+    fn from(error: TaskError) -> Self {
+        match error.into_join_error() {
+            Ok(error) => Self::ExecutionJoin(Box::new(error)),
+            Err(error) => Self::External(Box::new(error)),
+        }
+    }
+}
 
 impl From<std::fmt::Error> for DataFusionError {
     fn from(_e: std::fmt::Error) -> Self {
